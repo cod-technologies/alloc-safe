@@ -76,6 +76,9 @@ fn panic_hook(panic_info: &PanicInfo<'_>) {
     if !panic_info.payload().is::<AllocError>() {
         std::process::abort();
     }
+
+    #[cfg(feature = "global-allocator")]
+    allocator::ThreadPanic::set_panic();
 }
 
 /// Invokes a closure, capturing the panic of memory allocation error if one occurs.
@@ -96,14 +99,195 @@ pub fn catch_alloc_error<F: FnOnce() -> R + UnwindSafe, R>(f: F) -> Result<R, Al
         SET_HOOK.store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "global-allocator")]
+    allocator::ThreadPanic::try_reserve_mem()?;
+
     let result = std::panic::catch_unwind(f);
     match result {
         Ok(r) => Ok(r),
-        Err(e) => match e.downcast_ref::<AllocError>() {
-            None => {
-                unreachable!()
+        Err(e) => {
+            #[cfg(feature = "global-allocator")]
+            allocator::ThreadPanic::unset_panic();
+
+            match e.downcast_ref::<AllocError>() {
+                None => unreachable!(),
+                Some(e) => Err(*e),
             }
-            Some(e) => Err(*e),
-        },
+        }
+    }
+}
+
+#[cfg(feature = "global-allocator")]
+mod allocator {
+    use crate::AllocError;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::{Cell, RefCell};
+    use std::ptr::NonNull;
+
+    #[global_allocator]
+    static GLOBAL: Alloc = Alloc;
+
+    struct Alloc;
+
+    unsafe impl GlobalAlloc for Alloc {
+        #[inline]
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = System.alloc(layout);
+
+            if ptr.is_null() && ThreadPanic::is_in_panic() {
+                if let Some(p) = ThreadPanic::take_mem(layout) {
+                    return p.as_ptr();
+                }
+            }
+
+            ptr
+        }
+
+        #[inline]
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout)
+        }
+    }
+
+    struct PanicMem {
+        // See core::panic::BoxMeUp
+        box_me_up: Option<NonNull<u8>>,
+
+        // Panic handler doesn't alloc memory for Exception in Windows.
+        #[cfg(not(target_os = "windows"))]
+        exception: Option<NonNull<u8>>,
+    }
+
+    impl PanicMem {
+        const BOX_ME_UP_LAYOUT: Layout = unsafe { Layout::from_size_align_unchecked(16, 8) };
+
+        #[cfg(not(target_os = "windows"))]
+        const EXCEPTION_LAYOUT: Layout = unsafe { Layout::from_size_align_unchecked(80, 8) };
+
+        #[inline]
+        const fn new() -> Self {
+            PanicMem {
+                box_me_up: None,
+
+                #[cfg(not(target_os = "windows"))]
+                exception: None,
+            }
+        }
+
+        #[inline]
+        fn try_reserve(&mut self) -> Result<(), AllocError> {
+            if self.box_me_up.is_none() {
+                let ptr = unsafe { System.alloc(PanicMem::BOX_ME_UP_LAYOUT) };
+                if ptr.is_null() {
+                    return Err(AllocError::new(PanicMem::BOX_ME_UP_LAYOUT));
+                } else {
+                    self.box_me_up = unsafe { Some(NonNull::new_unchecked(ptr)) };
+                }
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            if self.exception.is_none() {
+                let ptr = unsafe { System.alloc(PanicMem::EXCEPTION_LAYOUT) };
+                if ptr.is_null() {
+                    return Err(AllocError::new(PanicMem::EXCEPTION_LAYOUT));
+                } else {
+                    self.exception = unsafe { Some(NonNull::new_unchecked(ptr)) };
+                }
+            }
+
+            Ok(())
+        }
+
+        #[inline]
+        fn take_mem(&mut self, layout: Layout) -> Option<NonNull<u8>> {
+            if layout == PanicMem::BOX_ME_UP_LAYOUT {
+                return self.box_me_up.take();
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            if layout == PanicMem::EXCEPTION_LAYOUT {
+                return self.exception.take();
+            }
+
+            None
+        }
+    }
+
+    impl Drop for PanicMem {
+        #[inline]
+        fn drop(&mut self) {
+            if let Some(mut ptr) = self.box_me_up.take() {
+                unsafe { System.dealloc(ptr.as_mut(), PanicMem::BOX_ME_UP_LAYOUT) };
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            if let Some(mut ptr) = self.exception.take() {
+                unsafe { System.dealloc(ptr.as_mut(), PanicMem::EXCEPTION_LAYOUT) };
+            }
+        }
+    }
+
+    thread_local! {
+        static THREAD_PANIC_MEM: RefCell<PanicMem> = RefCell::new(PanicMem::new());
+        static THREAD_IN_PANIC: Cell<bool> = Cell::new(false);
+    }
+
+    pub struct ThreadPanic;
+
+    impl ThreadPanic {
+        #[inline]
+        pub fn try_reserve_mem() -> Result<(), AllocError> {
+            THREAD_PANIC_MEM.with(|panic_mem| panic_mem.borrow_mut().try_reserve())
+        }
+
+        #[inline]
+        pub fn take_mem(layout: Layout) -> Option<NonNull<u8>> {
+            THREAD_PANIC_MEM.with(|panic_mem| panic_mem.borrow_mut().take_mem(layout))
+        }
+
+        #[inline]
+        pub fn set_panic() {
+            THREAD_IN_PANIC.with(|in_panic| in_panic.set(true))
+        }
+
+        #[inline]
+        pub fn unset_panic() {
+            THREAD_IN_PANIC.with(|in_panic| in_panic.set(false))
+        }
+
+        #[inline]
+        pub fn is_in_panic() -> bool {
+            THREAD_IN_PANIC.with(|in_panic| in_panic.get())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::catch_alloc_error;
+    use std::alloc::{AllocError as StdAllocError, Allocator, Layout};
+    use std::ptr::NonNull;
+
+    struct NoMem;
+
+    unsafe impl Allocator for NoMem {
+        #[inline]
+        fn allocate(&self, _layout: Layout) -> Result<NonNull<[u8]>, StdAllocError> {
+            Err(StdAllocError)
+        }
+
+        #[inline]
+        unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn test_catch_alloc_error() {
+        let result = catch_alloc_error(|| Vec::<u8, _>::with_capacity_in(10, NoMem));
+        assert_eq!(
+            result.unwrap_err().layout(),
+            Layout::from_size_align(10, 1).unwrap()
+        );
     }
 }
