@@ -76,9 +76,6 @@ fn panic_hook(panic_info: &PanicInfo<'_>) {
     if !panic_info.payload().is::<AllocError>() {
         std::process::abort();
     }
-
-    #[cfg(feature = "global-allocator")]
-    allocator::ThreadPanic::set_panic();
 }
 
 /// Invokes a closure, capturing the panic of memory allocation error if one occurs.
@@ -105,15 +102,10 @@ pub fn catch_alloc_error<F: FnOnce() -> R + UnwindSafe, R>(f: F) -> Result<R, Al
     let result = std::panic::catch_unwind(f);
     match result {
         Ok(r) => Ok(r),
-        Err(e) => {
-            #[cfg(feature = "global-allocator")]
-            allocator::ThreadPanic::unset_panic();
-
-            match e.downcast_ref::<AllocError>() {
-                None => unreachable!(),
-                Some(e) => Err(*e),
-            }
-        }
+        Err(e) => match e.downcast_ref::<AllocError>() {
+            None => unreachable!(),
+            Some(e) => Err(*e),
+        },
     }
 }
 
@@ -121,7 +113,7 @@ pub fn catch_alloc_error<F: FnOnce() -> R + UnwindSafe, R>(f: F) -> Result<R, Al
 mod allocator {
     use crate::AllocError;
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::ptr::NonNull;
 
     #[global_allocator]
@@ -134,7 +126,7 @@ mod allocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             let ptr = System.alloc(layout);
 
-            if ptr.is_null() && ThreadPanic::is_in_panic() {
+            if ptr.is_null() && std::thread::panicking() {
                 if let Some(p) = ThreadPanic::take_mem(layout) {
                     return p.as_ptr();
                 }
@@ -229,7 +221,6 @@ mod allocator {
 
     thread_local! {
         static THREAD_PANIC_MEM: RefCell<PanicMem> = RefCell::new(PanicMem::new());
-        static THREAD_IN_PANIC: Cell<bool> = Cell::new(false);
     }
 
     pub struct ThreadPanic;
@@ -243,21 +234,6 @@ mod allocator {
         #[inline]
         pub fn take_mem(layout: Layout) -> Option<NonNull<u8>> {
             THREAD_PANIC_MEM.with(|panic_mem| panic_mem.borrow_mut().take_mem(layout))
-        }
-
-        #[inline]
-        pub fn set_panic() {
-            THREAD_IN_PANIC.with(|in_panic| in_panic.set(true))
-        }
-
-        #[inline]
-        pub fn unset_panic() {
-            THREAD_IN_PANIC.with(|in_panic| in_panic.set(false))
-        }
-
-        #[inline]
-        pub fn is_in_panic() -> bool {
-            THREAD_IN_PANIC.with(|in_panic| in_panic.get())
         }
     }
 }
