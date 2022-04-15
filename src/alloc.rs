@@ -89,8 +89,8 @@ fn panic_hook(panic_info: &PanicInfo<'_>) {
 pub fn catch_alloc_error<F: FnOnce() -> R + UnwindSafe, R>(f: F) -> Result<R, AllocError> {
     static SET_HOOK: AtomicBool = AtomicBool::new(false);
     if !SET_HOOK.load(Ordering::Acquire) {
-        let hook: PanicHook =
-            Box::try_new(panic_hook).map_err(|_| AllocError::new(Layout::new::<PanicHook>()))?;
+        let hook: PanicHook = Box::try_new(panic_hook)
+            .map_err(|_| AllocError::new(Layout::new::<fn(&PanicInfo)>()))?;
         std::panic::set_hook(hook);
         std::alloc::set_alloc_error_hook(alloc_error_hook);
         SET_HOOK.store(true, Ordering::Release);
