@@ -9,7 +9,9 @@ mod sealed {
 }
 
 mod alloc;
+mod string;
 mod vec;
 
 pub use crate::alloc::{catch_alloc_error, AllocError};
 pub use crate::vec::{VecAllocExt, VecExt};
+pub use string::TryToString;
