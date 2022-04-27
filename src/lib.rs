@@ -9,7 +9,7 @@ mod sealed {
 }
 
 mod alloc;
-mod vec_ext;
+mod vec;
 
 pub use crate::alloc::{catch_alloc_error, AllocError};
-pub use crate::vec_ext::{VecAllocExt, VecExt};
+pub use crate::vec::{VecAllocExt, VecExt};
