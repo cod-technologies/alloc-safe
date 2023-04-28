@@ -110,21 +110,30 @@ pub fn catch_alloc_error<F: FnOnce() -> R + UnwindSafe, R>(f: F) -> Result<R, Al
 }
 
 #[cfg(feature = "global-allocator")]
-mod allocator {
+pub mod allocator {
     use crate::AllocError;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::RefCell;
     use std::ptr::NonNull;
 
-    #[global_allocator]
-    static GLOBAL: Alloc = Alloc;
+    pub struct Alloc<A: GlobalAlloc> {
+        allocator: A,
+    }
 
-    struct Alloc;
+    impl<A: GlobalAlloc> Alloc<A> {
+        pub const fn new(allocator: A) -> Self {
+            Self { allocator }
+        }
 
-    unsafe impl GlobalAlloc for Alloc {
+        pub fn raw_alloc(&self) -> &A {
+            &self.allocator
+        }
+    }
+
+    unsafe impl<A: GlobalAlloc> GlobalAlloc for Alloc<A> {
         #[inline]
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let ptr = System.alloc(layout);
+            let ptr = self.allocator.alloc(layout);
 
             if ptr.is_null() && std::thread::panicking() {
                 if let Some(p) = ThreadPanic::take_mem(layout) {
@@ -137,7 +146,7 @@ mod allocator {
 
         #[inline]
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            System.dealloc(ptr, layout)
+            self.allocator.dealloc(ptr, layout)
         }
     }
 
