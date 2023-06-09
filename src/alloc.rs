@@ -237,7 +237,9 @@ pub mod allocator {
     impl ThreadPanic {
         #[inline]
         pub fn try_reserve_mem() -> Result<(), AllocError> {
-            THREAD_PANIC_MEM.with(|panic_mem| panic_mem.borrow_mut().try_reserve())
+            THREAD_PANIC_MEM
+                .try_with(|panic_mem| panic_mem.borrow_mut().try_reserve())
+                .map_err(|_| AllocError::new(PanicMem::BOX_ME_UP_LAYOUT))?
         }
 
         #[inline]
