@@ -1,6 +1,6 @@
 [package]
 name = "alloc-safe"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.57"
 authors = ["David Li <davidli2010@foxmail.com>"]
